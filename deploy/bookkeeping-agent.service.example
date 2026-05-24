@@ -1,0 +1,17 @@
+[Unit]
+Description=Bookkeeping Agent
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=ubuntu
+WorkingDirectory=/opt/bookkeeping-agent
+EnvironmentFile=/etc/bookkeeping-agent.env
+Environment="PATH=/home/ubuntu/.local/bin:/usr/local/bin:/usr/bin:/bin"
+ExecStart=/usr/bin/env uv run python -m src.main
+Restart=always
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target

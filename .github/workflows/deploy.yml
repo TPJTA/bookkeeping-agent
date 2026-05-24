@@ -1,0 +1,44 @@
+name: Deploy
+
+on:
+  push:
+    branches:
+      - main
+  workflow_dispatch:
+
+concurrency:
+  group: deploy-production
+  cancel-in-progress: false
+
+jobs:
+  deploy:
+    name: Deploy to Tencent Cloud
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Configure SSH
+        env:
+          SSH_HOST: ${{ secrets.TENCENT_HOST }}
+          SSH_PORT: ${{ secrets.TENCENT_PORT || '22' }}
+          SSH_PRIVATE_KEY: ${{ secrets.TENCENT_SSH_KEY }}
+        run: |
+          mkdir -p ~/.ssh
+          printf '%s\n' "$SSH_PRIVATE_KEY" > ~/.ssh/tencent_deploy_key
+          chmod 600 ~/.ssh/tencent_deploy_key
+          ssh-keyscan -p "$SSH_PORT" -H "$SSH_HOST" >> ~/.ssh/known_hosts
+
+      - name: Deploy on server
+        env:
+          SSH_HOST: ${{ secrets.TENCENT_HOST }}
+          SSH_PORT: ${{ secrets.TENCENT_PORT || '22' }}
+          SSH_USER: ${{ secrets.TENCENT_USER }}
+          PROJECT_DIR: ${{ vars.PROJECT_DIR || '/opt/bookkeeping-agent' }}
+          SERVICE_NAME: ${{ vars.SERVICE_NAME || 'bookkeeping-agent' }}
+          BRANCH: main
+        run: |
+          ssh -i ~/.ssh/tencent_deploy_key -p "$SSH_PORT" "$SSH_USER@$SSH_HOST" \
+            "PROJECT_DIR='$PROJECT_DIR' SERVICE_NAME='$SERVICE_NAME' BRANCH='$BRANCH' bash -s" \
+            < scripts/deploy.sh

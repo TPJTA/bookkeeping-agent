@@ -62,6 +62,89 @@ uv run python -m src.main
 
 向机器人发一张订单截图,~1 秒内出现「🔍 识别中…」卡片,5-15 秒后变成「📋 待确认」卡片(带「✅ 确认」按钮)。
 
+## 部署到腾讯云
+
+仓库内已包含 GitHub Actions 部署模板:每次 push 到 `main` 会 SSH 到服务器,拉取最新代码,执行 `uv sync --frozen`,然后重启 `systemd` 服务。
+
+### 1. 服务器首次初始化
+
+以下命令只需要在腾讯云服务器上执行一次:
+
+```bash
+sudo mkdir -p /opt
+sudo chown -R "$USER:$USER" /opt
+cd /opt
+git clone <your-github-repo-url> bookkeeping-agent
+cd bookkeeping-agent
+
+# 安装 uv,如果服务器已经有 uv 可跳过
+curl -LsSf https://astral.sh/uv/install.sh | sh
+uv sync --frozen
+```
+
+把生产环境变量放到服务器的 `/etc/bookkeeping-agent.env`:
+
+```env
+MODAL_API_KEY=<your-key>
+MODAL_APP_NAME=GLM-4.6V
+MODAL_APP_BASE=https://open.bigmodel.cn/api/paas/v4
+LARK_APP_ID=cli_xxx
+LARK_APP_SECRET=xxx
+BITABLE_APP_TOKEN=<wiki-node-token-or-app-token>
+BITABLE_TABLE_ID=tbl_xxx
+```
+
+安装并启动 `systemd` 服务:
+
+```bash
+sudo cp deploy/bookkeeping-agent.service.example /etc/systemd/system/bookkeeping-agent.service
+sudo sed -i "s/User=ubuntu/User=$USER/" /etc/systemd/system/bookkeeping-agent.service
+sudo systemctl daemon-reload
+sudo systemctl enable --now bookkeeping-agent
+sudo systemctl status bookkeeping-agent
+```
+
+### 2. 配置 GitHub Secrets 和 Variables
+
+在 GitHub 仓库进入 `Settings` → `Secrets and variables` → `Actions`。
+
+添加这些 `Secrets`:
+
+- `TENCENT_HOST`:服务器公网 IP 或域名
+- `TENCENT_USER`:SSH 用户名,例如 `ubuntu` 或 `root`
+- `TENCENT_PORT`:SSH 端口,通常是 `22`
+- `TENCENT_SSH_KEY`:用于登录服务器的私钥内容
+
+建议添加这些 `Variables`:
+
+- `PROJECT_DIR`:`/opt/bookkeeping-agent`
+- `SERVICE_NAME`:`bookkeeping-agent`
+
+### 3. 配置 SSH key
+
+在本机生成一把专门给 GitHub Actions 用的部署 key:
+
+```bash
+ssh-keygen -t ed25519 -C "github-actions-bookkeeping-agent" -f ./bookkeeping-agent-deploy-key
+```
+
+把公钥追加到服务器:
+
+```bash
+ssh-copy-id -i ./bookkeeping-agent-deploy-key.pub <user>@<server-ip>
+```
+
+把私钥文件 `./bookkeeping-agent-deploy-key` 的完整内容填到 GitHub Secret `TENCENT_SSH_KEY`。
+
+之后 push 到 `main` 即会自动部署;也可以在 GitHub Actions 页面手动点 `Deploy` → `Run workflow`。
+
+常用排错命令:
+
+```bash
+sudo journalctl -u bookkeeping-agent -f
+sudo systemctl status bookkeeping-agent
+```
+
 ## 使用流程
 
 ```
