@@ -13,6 +13,20 @@ def _required(name: str) -> str:
     return v
 
 
+def _optional(name: str, default: str) -> str:
+    return os.environ.get(name) or default
+
+
+def _optional_int(name: str, default: int) -> int:
+    raw = os.environ.get(name)
+    if not raw:
+        return default
+    try:
+        return int(raw)
+    except ValueError as e:
+        raise RuntimeError(f"Invalid integer env var: {name}={raw!r}") from e
+
+
 @dataclass(frozen=True)
 class Config:
     lark_app_id: str
@@ -24,6 +38,8 @@ class Config:
     llm_api_key: str
     llm_base_url: str
     llm_model: str
+    web_host: str
+    web_port: int
 
 
 CONFIG = Config(
@@ -34,4 +50,6 @@ CONFIG = Config(
     llm_api_key=_required("MODAL_API_KEY"),
     llm_base_url=_required("MODAL_APP_BASE"),
     llm_model=_required("MODAL_APP_NAME"),
+    web_host=_optional("WEB_HOST", "0.0.0.0"),
+    web_port=_optional_int("WEB_PORT", 8000),
 )

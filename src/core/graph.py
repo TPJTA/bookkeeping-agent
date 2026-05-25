@@ -63,6 +63,7 @@ def node_write(state: BookkeepingState) -> dict[str, Any]:
         transaction=state["transaction"],
         image_bytes=state["image_bytes"],
         user_open_id=state.get("user_id") or None,
+        source=state.get("source") or None,
         confirmed=False,
     )
     logger.info("node=write record_id=%s status=待确认", rid)
@@ -77,6 +78,7 @@ def node_build_confirm_reply(state: BookkeepingState) -> dict[str, Any]:
             "type": "transaction_pending",
             "record_id": state["record_id"],
             "transaction": state["transaction"],
+            "source": state.get("source"),
         }
     }
 

@@ -28,9 +28,12 @@ F_CREATED_AT = "录入时间"
 F_CONFIRMED_AT = "确认时间"
 F_USER = "用户"
 F_SCREENSHOT = "截图"
+F_SOURCE = "来源"
 
 STATUS_PENDING = "待确认"
 STATUS_CONFIRMED = "已确认"
+SOURCE_FEISHU = "飞书"
+SOURCE_SHORTCUT = "快捷方式"
 
 
 logger = logging.getLogger(__name__)
@@ -130,6 +133,7 @@ class BitableClient:
         transaction: dict[str, Any],
         image_bytes: bytes,
         user_open_id: str | None = None,
+        source: str | None = None,
         confirmed: bool = False,
     ) -> str:
         file_token = self._upload_attachment(
@@ -151,6 +155,8 @@ class BitableClient:
             F_CREATED_AT: _now_ms(),
             F_SCREENSHOT: [{"file_token": file_token}],
         }
+        if source:
+            fields[F_SOURCE] = source
         if confirmed:
             fields[F_CONFIRMED_AT] = _now_ms()
         if amount is not None:

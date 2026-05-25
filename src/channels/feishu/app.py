@@ -17,6 +17,7 @@ from src.config import CONFIG
 from src.core import actions as core_actions
 from src.core.graph import GRAPH
 from src.core.state import BookkeepingState
+from src.storage.bitable import F_SOURCE, SOURCE_FEISHU
 
 logger = logging.getLogger(__name__)
 
@@ -33,10 +34,10 @@ _SEEN_MAX = 1024
 _seen_ids: OrderedDict[str, None] = OrderedDict()
 _seen_lock = Lock()
 
-# card_msg_id -> record_id, so when user replies to a confirm card we know
-# which record to modify. Bounded LRU; on miss the modify reply is rejected.
+# card_msg_id -> context, so when user replies to a confirm card we know which
+# record/source/screenshot to use. Bounded LRU; on miss the reply is rejected.
 _CARD_MAP_MAX = 256
-_card_to_record: OrderedDict[str, str] = OrderedDict()
+_card_to_context: OrderedDict[str, dict[str, str]] = OrderedDict()
 _card_map_lock = Lock()
 
 
@@ -51,25 +52,36 @@ def _claim_message(msg_id: str) -> bool:
         return True
 
 
-def _remember_card(card_msg_id: str, record_id: str) -> None:
+def remember_card(
+    card_msg_id: str,
+    record_id: str,
+    source: str | None = None,
+    image_key: str | None = None,
+) -> None:
     with _card_map_lock:
-        _card_to_record[card_msg_id] = record_id
-        _card_to_record.move_to_end(card_msg_id)
-        while len(_card_to_record) > _CARD_MAP_MAX:
-            _card_to_record.popitem(last=False)
+        ctx = {"record_id": record_id}
+        if source:
+            ctx["source"] = source
+        if image_key:
+            ctx["image_key"] = image_key
+        _card_to_context[card_msg_id] = ctx
+        _card_to_context.move_to_end(card_msg_id)
+        while len(_card_to_context) > _CARD_MAP_MAX:
+            _card_to_context.popitem(last=False)
 
 
 def _forget_card(card_msg_id: str) -> None:
     with _card_map_lock:
-        _card_to_record.pop(card_msg_id, None)
+        _card_to_context.pop(card_msg_id, None)
 
 
-def _lookup_card_record(card_msg_id: str) -> str | None:
+def _lookup_card_context(card_msg_id: str) -> dict[str, str] | None:
     with _card_map_lock:
-        rid = _card_to_record.get(card_msg_id)
-        if rid:
-            _card_to_record.move_to_end(card_msg_id)
-        return rid
+        ctx = _card_to_context.get(card_msg_id)
+        if ctx:
+            _card_to_context.move_to_end(card_msg_id)
+            return dict(ctx)
+        return None
 
 
 def _on_message(event: P2ImMessageReceiveV1) -> None:
@@ -114,10 +126,11 @@ def _on_message(event: P2ImMessageReceiveV1) -> None:
         if not parent_id:
             logger.info("skip text: not a reply (no parent_id)")
             return
-        record_id = _lookup_card_record(parent_id)
-        if not record_id:
+        card_context = _lookup_card_context(parent_id)
+        if not card_context:
             logger.info("skip text: parent_id=%s not in card->record map", parent_id)
             return
+        record_id = card_context["record_id"]
         content = json.loads(msg.content or "{}")
         user_text = (content.get("text") or "").strip()
         if not user_text:
@@ -127,7 +140,7 @@ def _on_message(event: P2ImMessageReceiveV1) -> None:
                     msg_id, parent_id, record_id, user_text)
         threading.Thread(
             target=_process_modify,
-            args=(msg_id, parent_id, record_id, user_text),
+            args=(msg_id, parent_id, record_id, user_text, card_context),
             daemon=True,
         ).start()
         return
@@ -139,7 +152,7 @@ def _process_image(msg_id: str, image_key: str, open_id: str) -> None:
     """Heavy path: send placeholder card, download, run graph (streams into the
     card), then update card to the final result."""
     try:
-        card_msg_id = _feishu.reply_card(msg_id, cards.pending_card())
+        card_msg_id = _feishu.reply_card(msg_id, cards.pending_card(SOURCE_FEISHU))
         logger.info("sent pending card card_msg_id=%s", card_msg_id)
     except Exception:
         logger.exception("failed to send pending card; aborting")
@@ -149,18 +162,19 @@ def _process_image(msg_id: str, image_key: str, open_id: str) -> None:
         data = _feishu.download_image(msg_id, image_key)
     except Exception as e:
         logger.exception("download failed")
-        _safe_update(card_msg_id, cards.error_card(f"图片下载失败:{e}"))
+        _safe_update(card_msg_id, cards.error_card(f"图片下载失败:{e}", SOURCE_FEISHU))
         return
 
     out = DOWNLOADS_DIR / f"{datetime.now():%Y%m%d_%H%M%S}_{msg_id}.png"
     out.write_bytes(data)
     logger.info("saved %s (%d bytes)", out.relative_to(DOWNLOADS_DIR.parent), len(data))
 
-    updater = _StreamUpdater(card_msg_id)
+    updater = _StreamUpdater(card_msg_id, source=SOURCE_FEISHU)
     initial: BookkeepingState = {
         "image_bytes": data,
         "user_id": open_id,
         "request_id": msg_id,
+        "source": SOURCE_FEISHU,
         "retries": 0,
         "on_progress": updater,
     }
@@ -168,7 +182,7 @@ def _process_image(msg_id: str, image_key: str, open_id: str) -> None:
         result = GRAPH.invoke(initial)
     except Exception as e:
         logger.exception("graph failed")
-        _safe_update(card_msg_id, cards.error_card(f"处理失败:{e}"))
+        _safe_update(card_msg_id, cards.error_card(f"处理失败:{e}", SOURCE_FEISHU))
         return
 
     logger.info(
@@ -177,18 +191,22 @@ def _process_image(msg_id: str, image_key: str, open_id: str) -> None:
     )
 
     reply = result.get("reply") or {}
-    card = _reply_to_card(reply)
+    card = reply_to_card(reply, source=SOURCE_FEISHU)
     _safe_update(card_msg_id, card)
 
     # Remember card -> record so user's reply (modify) can locate the record.
     record_id = result.get("record_id")
     if record_id and reply.get("type") == "transaction_pending":
-        _remember_card(card_msg_id, record_id)
+        remember_card(card_msg_id, record_id, source=SOURCE_FEISHU)
         logger.info("remembered card_msg_id=%s -> record_id=%s", card_msg_id, record_id)
 
 
 def _process_modify(
-    reply_msg_id: str, old_card_msg_id: str, record_id: str, user_text: str,
+    reply_msg_id: str,
+    old_card_msg_id: str,
+    record_id: str,
+    user_text: str,
+    card_context: dict[str, str],
 ) -> None:
     """User replied to a 待确认 card with a natural-language modification.
 
@@ -197,6 +215,9 @@ def _process_modify(
     success, mark the old card invalidated and switch the card->record map to
     the new card.
     """
+    source = card_context.get("source")
+    image_key = card_context.get("image_key")
+
     # Status guard: confirmed records can no longer be modified via chat
     try:
         if core_actions.is_confirmed(record_id):
@@ -211,7 +232,7 @@ def _process_modify(
 
     # Send a NEW pending card as a reply to the user's modification message.
     try:
-        new_card_msg_id = _feishu.reply_card(reply_msg_id, cards.pending_card())
+        new_card_msg_id = _feishu.reply_card(reply_msg_id, cards.pending_card(source))
         logger.info("sent new pending card card_msg_id=%s", new_card_msg_id)
     except Exception:
         logger.exception("failed to send new pending card")
@@ -219,12 +240,12 @@ def _process_modify(
         return
 
     # Stream model output into the NEW card
-    updater = _StreamUpdater(new_card_msg_id)
+    updater = _StreamUpdater(new_card_msg_id, source=source)
     try:
         result = core_actions.modify(record_id, user_text, on_progress=updater)
     except Exception as e:
         logger.exception("modify failed")
-        _safe_update(new_card_msg_id, cards.error_card(f"修改失败:{e}"))
+        _safe_update(new_card_msg_id, cards.error_card(f"修改失败:{e}", source))
         return
 
     rtype = result.get("type")
@@ -232,28 +253,37 @@ def _process_modify(
 
     if rtype == "transaction_pending":
         # Modification applied → finalize new card, invalidate old card, swap map.
-        _safe_update(new_card_msg_id, cards.confirm_card(record_id, result["transaction"]))
-        _safe_update(old_card_msg_id, cards.invalidated_card(old_tx))
+        _safe_update(
+            new_card_msg_id,
+            cards.confirm_card(record_id, result["transaction"], source, image_key),
+        )
+        _safe_update(old_card_msg_id, cards.invalidated_card(old_tx, source, image_key))
         _forget_card(old_card_msg_id)
-        _remember_card(new_card_msg_id, record_id)
+        remember_card(new_card_msg_id, record_id, source=source, image_key=image_key)
         return
 
     if rtype == "no_modification":
         # No real change → drop the new card to an info state, leave old card untouched.
-        _safe_update(new_card_msg_id, cards.no_modification_card())
+        _safe_update(new_card_msg_id, cards.no_modification_card(source))
         return
 
     # parse / validation error
-    _safe_update(new_card_msg_id, cards.error_card(result.get("text", "未知错误")))
+    _safe_update(new_card_msg_id, cards.error_card(result.get("text", "未知错误"), source))
 
 
 class _StreamUpdater:
     """Throttled card-patching callback. Called by the LLM streaming loop with
     the accumulating text; pushes a typing_card update at most once per `interval`."""
 
-    def __init__(self, card_msg_id: str, interval: float = 0.4) -> None:
+    def __init__(
+        self,
+        card_msg_id: str,
+        interval: float = 0.4,
+        source: str | None = None,
+    ) -> None:
         self.card_msg_id = card_msg_id
         self.interval = interval
+        self.source = source
         self.last_update = 0.0
 
     def __call__(self, text: str) -> None:
@@ -261,21 +291,31 @@ class _StreamUpdater:
         if now - self.last_update < self.interval:
             return
         try:
-            _feishu.update_card(self.card_msg_id, cards.typing_card(text))
+            _feishu.update_card(self.card_msg_id, cards.typing_card(text, self.source))
             self.last_update = now
         except Exception:
             logger.warning("typing card update failed (continuing stream)")
 
 
-def _reply_to_card(reply: dict[str, Any]) -> dict[str, Any]:
+def reply_to_card(
+    reply: dict[str, Any],
+    source: str | None = None,
+    image_key: str | None = None,
+) -> dict[str, Any]:
     rtype = reply.get("type")
+    source = source or reply.get("source")
     if rtype == "transaction_pending":
-        return cards.confirm_card(reply["record_id"], reply["transaction"])
+        return cards.confirm_card(
+            reply["record_id"],
+            reply["transaction"],
+            source=source,
+            image_key=image_key,
+        )
     if rtype == "not_transaction":
-        return cards.not_transaction_card(reply.get("text", ""))
+        return cards.not_transaction_card(reply.get("text", ""), source, image_key)
     if rtype == "error":
-        return cards.error_card(reply.get("text", ""))
-    return cards.error_card(f"未知 reply 类型:{rtype}")
+        return cards.error_card(reply.get("text", ""), source)
+    return cards.error_card(f"未知 reply 类型:{rtype}", source)
 
 
 def _on_card_action(req: Any) -> Any:
@@ -312,12 +352,15 @@ def _on_card_action(req: Any) -> Any:
 
 def _process_confirm(record_id: str, card_msg_id: str) -> None:
     logger.info("process_confirm record_id=%s card_msg_id=%s", record_id, card_msg_id)
+    card_context = _lookup_card_context(card_msg_id) or {}
+    source = card_context.get("source")
+    image_key = card_context.get("image_key")
     try:
         core_actions.confirm(record_id)
         logger.info("bitable mark_confirmed OK record_id=%s", record_id)
     except Exception as e:
         logger.exception("step=confirm failed")
-        _safe_update(card_msg_id, cards.error_card(f"确认失败:{e}"))
+        _safe_update(card_msg_id, cards.error_card(f"确认失败:{e}", source))
         return
 
     try:
@@ -329,7 +372,8 @@ def _process_confirm(record_id: str, card_msg_id: str) -> None:
             "amount": str(fields.get("金额", "")),
             "confidence": float(fields.get("置信度") or 0),
         }
-        _safe_update(card_msg_id, cards.confirmed_card(record_id, tx))
+        source = source or fields.get(F_SOURCE)
+        _safe_update(card_msg_id, cards.confirmed_card(record_id, tx, source, image_key))
         logger.info("card updated to confirmed_card")
     except Exception:
         logger.exception("step=post-confirm card update failed")

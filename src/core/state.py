@@ -6,6 +6,7 @@ class BookkeepingState(TypedDict, total=False):
     image_bytes: bytes
     user_id: str            # open_id of sender (may be empty)
     request_id: str         # e.g. message_id, for traceability
+    source: str             # e.g. 飞书 / 快捷方式
     # Optional streaming hook: graph nodes call this with the accumulating
     # model output during analyze. Channel adapter wires it to a throttled
     # card-update closure. None = no streaming.
