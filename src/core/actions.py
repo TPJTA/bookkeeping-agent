@@ -7,7 +7,7 @@ from pydantic import ValidationError
 from src.core.schema import ModifyResult
 from src.llm.glm import call_text, extract_json
 from src.prompts import load_prompt
-from src.storage.bitable import bitable_client
+from src.storage.bitable import RecordNotFoundError, bitable_client
 
 logger = logging.getLogger(__name__)
 
@@ -18,6 +18,37 @@ def confirm(record_id: str) -> None:
     """Mark a pending record as 已确认. Called when user clicks the confirm button."""
     logger.info("action=confirm record_id=%s", record_id)
     bitable_client.mark_confirmed(record_id)
+
+
+def cancel(record_id: str) -> dict[str, Any]:
+    """Delete a pending bookkeeping candidate from Bitable."""
+    logger.info("action=cancel record_id=%s", record_id)
+    try:
+        fields = bitable_client.get_record(record_id)
+    except RecordNotFoundError:
+        logger.info("cancel: record already missing record_id=%s", record_id)
+        return {"type": "already_cancelled", "record_id": record_id}
+
+    tx = bitable_client.transaction_from_fields(fields)
+    if bitable_client.fields_are_confirmed(fields):
+        logger.info("cancel: record already confirmed record_id=%s", record_id)
+        return {
+            "type": "confirmed",
+            "record_id": record_id,
+            "transaction": tx,
+        }
+
+    try:
+        bitable_client.delete_record(record_id)
+    except RecordNotFoundError:
+        logger.info("cancel: record disappeared during delete record_id=%s", record_id)
+
+    logger.info("cancel: deleted record_id=%s", record_id)
+    return {
+        "type": "cancelled",
+        "record_id": record_id,
+        "transaction": tx,
+    }
 
 
 def get_record(record_id: str) -> dict:

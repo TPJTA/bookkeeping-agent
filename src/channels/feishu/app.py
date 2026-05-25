@@ -319,7 +319,7 @@ def reply_to_card(
 
 
 def _on_card_action(req: Any) -> Any:
-    """Handle clicks on card buttons (the only one for now: 「确认」)."""
+    """Handle clicks on card buttons."""
     try:
         # Dump full request once so we know the exact attribute paths on this SDK version
         try:
@@ -332,13 +332,23 @@ def _on_card_action(req: Any) -> Any:
         card_msg_id = req.event.context.open_message_id
         logger.info("card action value=%s card_msg_id=%s", value, card_msg_id)
 
-        if value.get("action") != "confirm":
+        action_type = value.get("action")
+        if action_type not in {"confirm", "cancel"}:
             logger.info("ignore unknown card action: %s", value)
             return
 
         record_id = value.get("record_id")
         if not record_id:
-            logger.warning("confirm action missing record_id")
+            logger.warning("card action missing record_id")
+            return
+
+        if action_type == "cancel":
+            transaction = value.get("transaction")
+            threading.Thread(
+                target=_process_cancel,
+                args=(record_id, card_msg_id, transaction),
+                daemon=True,
+            ).start()
             return
 
         threading.Thread(
@@ -348,6 +358,45 @@ def _on_card_action(req: Any) -> Any:
         ).start()
     except Exception:
         logger.exception("card action handler crashed")
+
+
+def _process_cancel(
+    record_id: str,
+    card_msg_id: str,
+    transaction: dict[str, Any] | None = None,
+) -> None:
+    logger.info("process_cancel record_id=%s card_msg_id=%s", record_id, card_msg_id)
+    card_context = _lookup_card_context(card_msg_id) or {}
+    source = card_context.get("source")
+    image_key = card_context.get("image_key")
+    try:
+        result = core_actions.cancel(record_id)
+        logger.info("bitable cancel OK type=%s record_id=%s", result.get("type"), record_id)
+    except Exception as e:
+        logger.exception("step=cancel failed")
+        _safe_update(
+            card_msg_id,
+            cards.error_card(
+                f"撤销失败:{e}\n请去多维表格中手动删除这条记录。",
+                source,
+            ),
+        )
+        _forget_card(card_msg_id)
+        return
+
+    rtype = result.get("type")
+    if rtype == "confirmed":
+        _safe_update(
+            card_msg_id,
+            cards.error_card("该记录已确认,不能撤销。请去多维表格中自行修改。", source),
+        )
+        _forget_card(card_msg_id)
+        return
+
+    tx = result.get("transaction") or transaction or {}
+    _safe_update(card_msg_id, cards.cancelled_card(tx, source, image_key))
+    _forget_card(card_msg_id)
+    logger.info("card updated to cancelled_card")
 
 
 def _process_confirm(record_id: str, card_msg_id: str) -> None:

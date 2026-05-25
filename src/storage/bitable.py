@@ -7,6 +7,7 @@ import lark_oapi as lark
 from lark_oapi.api.bitable.v1 import (
     AppTableRecord,
     CreateAppTableRecordRequest,
+    DeleteAppTableRecordRequest,
     GetAppTableRecordRequest,
     ListAppTableFieldRequest,
     UpdateAppTableRecordRequest,
@@ -39,6 +40,10 @@ SOURCE_SHORTCUT = "快捷方式"
 logger = logging.getLogger(__name__)
 
 
+class RecordNotFoundError(RuntimeError):
+    """Raised when a Bitable record no longer exists."""
+
+
 def _now_ms() -> int:
     return int(time.time() * 1000)
 
@@ -56,6 +61,33 @@ def _str_field(v: Any) -> str:
             for item in v
         )
     return str(v)
+
+
+def _is_record_not_found(code: int | str | None, msg: str | None) -> bool:
+    text = f"{code or ''} {msg or ''}".lower()
+    return any(
+        marker in text
+        for marker in (
+            "not found",
+            "not exist",
+            "recordidnotfound",
+            "record_id not",
+            "record not",
+            "不存在",
+        )
+    )
+
+
+def _transaction_from_fields(fields: dict[str, Any]) -> dict[str, Any]:
+    amount = fields.get(F_AMOUNT)
+    return {
+        "is_transaction": True,
+        "merchant": _str_field(fields.get(F_MERCHANT)),
+        "goods": _str_field(fields.get(F_GOODS)),
+        "category": _str_field(fields.get(F_CATEGORY)) or "其他",
+        "amount": "" if amount is None else str(amount),
+        "confidence": float(fields.get(F_CONFIDENCE) or 0),
+    }
 
 
 class BitableClient:
@@ -199,6 +231,10 @@ class BitableClient:
         )
         resp = self._client.bitable.v1.app_table_record.get(req)
         if not resp.success():
+            if _is_record_not_found(resp.code, resp.msg):
+                raise RecordNotFoundError(
+                    f"record not found: record_id={record_id} code={resp.code} msg={resp.msg}"
+                )
             raise RuntimeError(
                 f"get_record failed: code={resp.code} msg={resp.msg}"
             )
@@ -206,16 +242,10 @@ class BitableClient:
 
     def get_transaction(self, record_id: str) -> dict[str, Any]:
         """Read a record and return it shaped like our Transaction dict."""
-        fields = self.get_record(record_id)
-        amount = fields.get(F_AMOUNT)
-        return {
-            "is_transaction": True,
-            "merchant": _str_field(fields.get(F_MERCHANT)),
-            "goods": _str_field(fields.get(F_GOODS)),
-            "category": _str_field(fields.get(F_CATEGORY)) or "其他",
-            "amount": "" if amount is None else str(amount),
-            "confidence": float(fields.get(F_CONFIDENCE) or 0),
-        }
+        return self.transaction_from_fields(self.get_record(record_id))
+
+    def transaction_from_fields(self, fields: dict[str, Any]) -> dict[str, Any]:
+        return _transaction_from_fields(fields)
 
     def update_transaction(self, record_id: str, transaction: dict[str, Any]) -> None:
         """Update the editable transaction fields. Does not touch status / time / attachment."""
@@ -236,8 +266,28 @@ class BitableClient:
         self._update_fields(record_id, fields)
 
     def is_confirmed(self, record_id: str) -> bool:
-        fields = self.get_record(record_id)
+        return self.fields_are_confirmed(self.get_record(record_id))
+
+    def fields_are_confirmed(self, fields: dict[str, Any]) -> bool:
         return _str_field(fields.get(F_STATUS)) == STATUS_CONFIRMED
+
+    def delete_record(self, record_id: str) -> None:
+        req = (
+            DeleteAppTableRecordRequest.builder()
+            .app_token(self._app_token)
+            .table_id(self._table_id)
+            .record_id(record_id)
+            .build()
+        )
+        resp = self._client.bitable.v1.app_table_record.delete(req)
+        if not resp.success():
+            if _is_record_not_found(resp.code, resp.msg):
+                raise RecordNotFoundError(
+                    f"record not found: record_id={record_id} code={resp.code} msg={resp.msg}"
+                )
+            raise RuntimeError(
+                f"delete_record failed: code={resp.code} msg={resp.msg}"
+            )
 
     def _update_fields(self, record_id: str, fields: dict[str, Any]) -> None:
         record = AppTableRecord.builder().fields(fields).build()
