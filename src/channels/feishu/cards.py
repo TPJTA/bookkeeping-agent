@@ -122,6 +122,16 @@ def confirm_card(
                     "text": {"tag": "plain_text", "content": "✅ 确认"},
                     "type": "primary",
                     "value": {"action": "confirm", "record_id": record_id},
+                },
+                {
+                    "tag": "button",
+                    "text": {"tag": "plain_text", "content": "撤销"},
+                    "type": "danger",
+                    "value": {
+                        "action": "cancel",
+                        "record_id": record_id,
+                        "transaction": transaction,
+                    },
                 }
             ]},
         ]),
@@ -147,6 +157,28 @@ def confirmed_card(
             _screenshot_block(image_key),
             {"tag": "note", "elements": [{"tag": "lark_md",
              "content": f"record_id: `{record_id}`"}]},
+        ]),
+    }
+
+
+def cancelled_card(
+    transaction: dict[str, Any],
+    source: str | None = None,
+    image_key: str | None = None,
+) -> dict[str, Any]:
+    return {
+        "config": {"wide_screen_mode": True, "update_multi": True},
+        "header": {
+            "title": {"tag": "plain_text",
+                      "content": f"已撤销 · {source}" if source else "已撤销"},
+            "template": "grey",
+        },
+        "elements": _without_none([
+            _fields_block(transaction),
+            _goods_block(transaction),
+            _screenshot_block(image_key),
+            {"tag": "note", "elements": [{"tag": "lark_md",
+             "content": "该待确认记录已撤销,多维表格中的候选记录已删除。"}]},
         ]),
     }
 
