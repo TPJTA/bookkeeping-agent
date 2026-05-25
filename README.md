@@ -9,13 +9,14 @@
 - 📋 **两阶段确认** —— 先「📋 待确认」+ 原图存档,点「✅ 确认」后置「✅ 已记账」
 - ✏️ **自然语言修改** —— 回复卡片「金额改成 50」「类别改为交通」,LLM 合并后旧卡片标记「🚫 已失效」,新卡片挂在你的修改消息下面
 - 🛡️ **健壮性** —— Pydantic schema 校验 + 失败重试、`message_id` 幂等去重、handler 立即 ack(避免飞书超时重发)
-- 🔌 **多入口架构** —— `channels/feishu/` 是渠道适配层,业务核心 `core/` 完全不认识飞书,加企业微信/Web 入口只动 channels
+- 🔌 **多入口架构** —— 飞书图片入口 + Apple 快捷方式 Webhook 入口,业务核心 `core/` 完全不认识渠道
 
 ## 技术栈
 
 - **[LangGraph](https://langchain-ai.github.io/langgraph/) 1.x** —— 业务编排,`analyze → validate → write → reply`,validate 失败回 analyze 重试(repair loop)
 - **GLM-4.6V**(智谱) —— 多模态识别 + 文本修改合并,经 OpenAI 兼容网关调用
 - **[lark-oapi](https://github.com/larksuite/oapi-sdk-python)** —— 飞书 SDK,WebSocket 长连接接收事件
+- **FastAPI + Uvicorn** —— Apple 快捷方式 Webhook,接收截图后异步进入识别流程
 - **Pydantic 2** —— schema 校验,自动触发 LLM 修复重试
 - **Pillow** —— 图片缩放(送 LLM 前缩到 1600px JPEG,实测 ~50% 提速)
 
@@ -42,6 +43,10 @@ LARK_APP_SECRET=xxx
 # 飞书多维表格(URL 形如 https://xxx.feishu.cn/wiki/<token>?table=<table_id>)
 BITABLE_APP_TOKEN=<wiki-node-token-or-app-token>
 BITABLE_TABLE_ID=tbl_xxx
+
+# Apple 快捷方式 Webhook
+WEB_HOST=0.0.0.0
+WEB_PORT=8000
 ```
 
 ### 3. 飞书后台配置
@@ -52,7 +57,7 @@ BITABLE_TABLE_ID=tbl_xxx
 - ✅ **权限 scope**:`im:message`、机器人发消息、读消息中的图片、`bitable:app`、`wiki:node:read`、附件上传相关
 - ✅ 若多维表格挂在知识库下:把 bot **加为该 wiki 节点的协作者**(权限选「可编辑」)
 - ✅ 在多维表格里**手动建好这些字段**:
-   `商户`(文本)/ `商品`(文本)/ `类别`(单选:餐饮/交通/购物/娱乐/生活缴费/其他)/ `金额`(数字)/ `状态`(单选:待确认/已确认)/ `置信度`(数字)/ `录入时间`(日期)/ `确认时间`(日期)/ `用户`(人员)/ `截图`(附件)
+   `商户`(文本)/ `商品`(文本)/ `类别`(单选:餐饮/交通/购物/娱乐/生活缴费/其他)/ `金额`(数字)/ `状态`(单选:待确认/已确认)/ `置信度`(数字)/ `录入时间`(日期)/ `确认时间`(日期)/ `用户`(人员)/ `截图`(附件)/ `来源`(单选:飞书/快捷方式)
 
 ### 4. 启动
 
@@ -61,6 +66,19 @@ uv run python -m src.main
 ```
 
 向机器人发一张订单截图,~1 秒内出现「🔍 识别中…」卡片,5-15 秒后变成「📋 待确认」卡片(带「✅ 确认」按钮)。
+
+Apple 快捷方式入口:
+
+```http
+POST /webhook/order-screenshot
+Content-Type: multipart/form-data
+```
+
+表单字段:
+- `image`:截图文件
+- `WEB_REVIEW_CHAT_ID`:识别结果要发送到的飞书会话 `chat_id`
+
+接口成功接收后立即返回 `202 Accepted`,只代表图片已被接收;识别中、待确认、失败、非交易截图都会反馈到请求携带的 `WEB_REVIEW_CHAT_ID` 对应飞书会话。快捷方式来源的确认卡片会展示截图缩略图,飞书图片来源不额外展示截图。
 
 ## 部署到腾讯云
 
@@ -92,6 +110,8 @@ LARK_APP_ID=cli_xxx
 LARK_APP_SECRET=xxx
 BITABLE_APP_TOKEN=<wiki-node-token-or-app-token>
 BITABLE_TABLE_ID=tbl_xxx
+WEB_HOST=0.0.0.0
+WEB_PORT=8000
 ```
 
 安装并启动 `systemd` 服务:
@@ -148,9 +168,9 @@ sudo systemctl status bookkeeping-agent
 ## 使用流程
 
 ```
-发送截图
+发送截图 / 快捷方式上传截图
   ↓
-[🔍 识别中…]  ← 立即出现(handler 已 ack)
+[🔍 识别中…]  ← 飞书入口回复原消息;快捷方式入口发送到确认群
   ↓ 流式打字机(JSON 一段一段往里"打")
   ↓
 [📋 待确认]  「商户:XX  金额:¥51  类别:餐饮 ...」+ [✅ 确认] 按钮
@@ -174,7 +194,7 @@ sudo systemctl status bookkeeping-agent
 src/
 ├── config.py             # 集中配置(读 .env,启动即校验)
 ├── prompts.py            # load_prompt() — 加载 prompts/*.md + 替换 $var
-├── main.py               # 入口,启动 feishu channel
+├── main.py               # 入口,启动飞书长连接 + Webhook 服务
 ├── core/                 # 业务核心,完全不认识飞书
 │   ├── schema.py         # Pydantic Transaction / ModifyResult
 │   ├── state.py          # BookkeepingState TypedDict
@@ -185,10 +205,12 @@ src/
 ├── storage/
 │   └── bitable.py        # 多维表格 CRUD + 附件上传 + wiki→obj_token 解析
 └── channels/
-    └── feishu/
-        ├── app.py        # ws 入口 + 事件分发 + 后台线程 + 幂等
-        ├── client.py     # SDK 封装
-        └── cards.py      # 8 种卡片 JSON 构造器
+    ├── feishu/
+    │   ├── app.py        # ws 入口 + 事件分发 + 后台线程 + 幂等
+    │   ├── client.py     # SDK 封装
+    │   └── cards.py      # 交互卡片 JSON 构造器
+    └── web/
+        └── app.py        # FastAPI Webhook: Apple 快捷方式上传截图
 ```
 
 设计文档与踩坑记录详见 [`TECH_DESIGN.md`](./TECH_DESIGN.md)。

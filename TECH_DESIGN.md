@@ -3,13 +3,13 @@
 > 通过飞书发送订单截图 → 多模态大模型识别交易信息 → 写入飞书多维表格 → 用户确认/修改。
 > 本文档用于动手写代码前的方案对齐,会随讨论持续更新。
 
-最后更新:2026-05-25(v4 — 完整实现版)
+最后更新:2026-05-25(v5 — Apple 快捷方式 Webhook 入口)
 
 ---
 
 ## 1. 目标与范围
 
-**做什么:** 用户在飞书里给机器人发一张支付/订单截图,程序自动识别出交易信息(商户、商品、类别、金额),先以「待确认」状态写入飞书多维表格,并回复一张交互卡片;用户点「确认」→ 记录变「已确认」;用户直接**回复消息**(自然语言)→ 程序理解其意图、修改对应字段,再次发卡片请确认。
+**做什么:** 用户在飞书里给机器人发一张支付/订单截图,或通过 Apple 快捷方式把截图 POST 到 Webhook;程序自动识别出交易信息(商户、商品、类别、金额),先以「待确认」状态写入飞书多维表格,并在飞书里给出交互卡片;用户点「确认」→ 记录变「已确认」;用户直接**回复消息**(自然语言)→ 程序理解其意图、修改对应字段,再次发卡片请确认。
 
 **本期范围(MVP)— 已全部实现 ✅:**
 - 单张图片 → 单笔交易识别
@@ -17,7 +17,8 @@
 - 交互卡片「确认」按钮 → 状态置「已确认」
 - 用户文本回复 → LLM 理解修改意图 → 旧卡片置「已失效」,挂出新卡片
 - 开发期用长连接(WebSocket)接收事件,无需公网
-- **结构上为「多入口」预留**:飞书只是第一个 channel,核心业务与渠道解耦
+- **Apple 快捷方式 Webhook 入口**:`POST /webhook/order-screenshot`,成功返回只表示已接收;后续识别/确认都在飞书确认群进行
+- **多入口结构**:飞书与 Web 都是 channel,核心业务与渠道解耦
 - **实施中追加(见 §11)**:LLM 流式输出 + 打字机卡片、handler 异步化、message_id 幂等、图片缩放
 
 **暂不做(后续迭代):**
@@ -41,6 +42,10 @@
 | 8 | 输出规范 | **解析 + Pydantic 校验 + 失败重试(repair loop)** | `GLM-4.6V` 经网关不支持 `response_format`,改由图里 `validate` 节点把关、失败回喂错误重试 |
 | 9 | 修改的关联 | **靠回复的 `parent_id` → 映射出 `record_id`** | 不必拉父消息内容;字段值从 Bitable 读取(事实来源) |
 | 10 | 修改后流程 | **改完仍「待确认」,重发卡片再请确认** | 已确认记录被回复时,提示去多维表格自行修改 |
+| 11 | Webhook 返回语义 | **HTTP 202 = 已接收** | 不等待识别/写表;成功、失败、非交易截图都反馈到飞书确认群 |
+| 12 | 来源标记 | **Bitable `来源` 单选** | 新记录写 `飞书` 或 `快捷方式`;历史记录不回填 |
+| 13 | Web 卡片截图 | **仅快捷方式来源展示缩略图** | 飞书来源已有原始图片消息,不重复展示 |
+| 14 | Webhook 目标会话 | **请求表单携带 `WEB_REVIEW_CHAT_ID`** | 不再校验 Bearer token;按请求参数决定反馈到哪个飞书会话 |
 
 ---
 
@@ -104,6 +109,7 @@ class BookkeepingState(TypedDict, total=False):
     image_bytes: bytes      # 原图字节,用于 LLM 识别 + 上传 Bitable 附件
     user_id: str            # 发送者 open_id(渠道无关的字符串)
     request_id: str         # 幂等去重用(如 message_id)
+    source: str             # 飞书 / 快捷方式
     on_progress: Optional[Callable[[str], None]]   # 可选流式回调(见 §11.3)
     # —— 中间产物 ——
     raw_output: Optional[str]     # LLM 返回的原始文本(交给 validate 解析)
@@ -225,6 +231,7 @@ START
 | 确认时间 | 日期 | 确认时刻 |
 | 用户 | 文本/人员 | 发送者 |
 | 截图 | 附件 | 原图(必存) |
+| 来源 | 单选(飞书/快捷方式) | 入口 channel |
 
 > 已移除「原始消息ID」列(按反馈)。幂等去重改在程序内存/runtime 层处理,不落表。
 
@@ -268,18 +275,18 @@ client = OpenAI(api_key=CONFIG.llm_api_key, base_url=CONFIG.llm_base_url)
 
 ```
 bookkeeping-agent/
-├── .env                  # LARK_* / MODAL_* / BITABLE_*
+├── .env                  # LARK_* / MODAL_* / BITABLE_* / WEB_*
 ├── prompts/
 │   ├── recognize.md          # 识别 prompt
 │   └── modify.md             # 修改合并 prompt($current_json / $user_text)
-├── pyproject.toml            # langgraph / lark-oapi / openai / pydantic / python-dotenv / pillow
+├── pyproject.toml            # langgraph / lark-oapi / openai / fastapi / uvicorn / pydantic / python-dotenv / pillow
 ├── TECH_DESIGN.md
 ├── README.md
 └── src/
     ├── __init__.py           # logging.basicConfig(时间戳/level/模块名)
     ├── config.py             # CONFIG: 集中读 .env、必填字段校验
     ├── prompts.py            # load_prompt(name, **vars)
-    ├── main.py               # 入口:python -m src.main
+    ├── main.py               # 入口:飞书 WS 后台线程 + Webhook Uvicorn 主线程
     │
     ├── core/                 # 业务核心,渠道无关
     │   ├── schema.py         # Transaction / ModifyResult(Pydantic 校验 + 修复重试)
@@ -294,10 +301,12 @@ bookkeeping-agent/
     │   └── bitable.py        # 单例 bitable_client:wiki→obj_token 解析、CRUD、附件上传
     │
     └── channels/             # 入口适配层
-        └── feishu/
-            ├── app.py        # ws 入口 + 事件分发 + 后台线程 + 幂等去重 + card map
-            ├── client.py     # SDK 封装:download_image / reply_text / reply_card / update_card
-            └── cards.py      # pending / typing / confirm / confirmed / invalidated / no_modification / not_transaction / error
+        ├── feishu/
+        │   ├── app.py        # ws 入口 + 事件分发 + 后台线程 + 幂等去重 + card map
+        │   ├── client.py     # SDK 封装:download_image / send_card / upload_image / reply_card / update_card
+        │   └── cards.py      # pending / typing / confirm / confirmed / invalidated / no_modification / not_transaction / error
+        └── web/
+            └── app.py        # FastAPI Webhook:multipart image + WEB_REVIEW_CHAT_ID + 202 accepted
 ```
 
 > **关于 prompt 存储:** 用 `.md` 文件而不是嵌进 .py,理由是 ① 改 prompt 不动 Python、PR diff 干净 ② 不用处理 f-string 与 JSON `{}` 的转义冲突。模板变量用 `$name` 语法(`string.Template.safe_substitute`)而不是 `{name}`,这样 prompt 里可以放 `{...}` 形式的 JSON 示例。

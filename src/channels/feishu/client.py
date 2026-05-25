@@ -1,8 +1,11 @@
 import json
+import io
 from typing import Any
 
 import lark_oapi as lark
 from lark_oapi.api.im.v1 import (
+    CreateImageRequest,
+    CreateImageRequestBody,
     CreateMessageRequest,
     CreateMessageRequestBody,
     GetMessageResourceRequest,
@@ -60,6 +63,42 @@ class FeishuClient:
             raise RuntimeError(
                 f"send_text failed: code={resp.code} msg={resp.msg}"
             )
+
+    def send_card(self, chat_id: str, card: dict[str, Any]) -> str:
+        """Send an interactive card to a chat. Returns the new message_id."""
+        body = (
+            CreateMessageRequestBody.builder()
+            .receive_id(chat_id)
+            .msg_type("interactive")
+            .content(json.dumps(card, ensure_ascii=False))
+            .build()
+        )
+        req = (
+            CreateMessageRequest.builder()
+            .receive_id_type("chat_id")
+            .request_body(body)
+            .build()
+        )
+        resp = self._client.im.v1.message.create(req)
+        if not resp.success():
+            raise RuntimeError(f"send_card failed: code={resp.code} msg={resp.msg}")
+        return resp.data.message_id
+
+    def upload_image(self, image_bytes: bytes) -> str:
+        """Upload an image for use in Feishu messages/cards. Returns image_key."""
+        body = (
+            CreateImageRequestBody.builder()
+            .image_type("message")
+            .image(io.BytesIO(image_bytes))
+            .build()
+        )
+        req = CreateImageRequest.builder().request_body(body).build()
+        resp = self._client.im.v1.image.create(req)
+        if not resp.success():
+            raise RuntimeError(
+                f"upload_image failed: code={resp.code} msg={resp.msg}"
+            )
+        return resp.data.image_key
 
     def reply_text(self, message_id: str, text: str) -> None:
         body = (
