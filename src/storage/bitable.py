@@ -1,15 +1,20 @@
 import io
 import logging
 import time
+from datetime import datetime
 from typing import Any
 
 import lark_oapi as lark
 from lark_oapi.api.bitable.v1 import (
     AppTableRecord,
+    Condition,
     CreateAppTableRecordRequest,
     DeleteAppTableRecordRequest,
+    FilterInfo,
     GetAppTableRecordRequest,
     ListAppTableFieldRequest,
+    SearchAppTableRecordRequest,
+    SearchAppTableRecordRequestBody,
     UpdateAppTableRecordRequest,
 )
 from lark_oapi.api.drive.v1 import UploadAllMediaRequest, UploadAllMediaRequestBody
@@ -48,6 +53,21 @@ def _now_ms() -> int:
     return int(time.time() * 1000)
 
 
+def _month_range_ms(when_ms: int | None = None) -> tuple[int, int]:
+    """返回 when_ms 所在自然月的 [起始, 下月起始) 时间戳(毫秒)。
+
+    用于筛选「本月」的记录:start <= 录入时间 < end。默认取当前时间。
+    """
+    now = datetime.fromtimestamp((when_ms or _now_ms()) / 1000)
+    start = now.replace(day=1, hour=0, minute=0, second=0, microsecond=0)
+    # 跳到下个月 1 号:12 月要进位到下一年的 1 月
+    if start.month == 12:
+        end = start.replace(year=start.year + 1, month=1)
+    else:
+        end = start.replace(month=start.month + 1)
+    return int(start.timestamp() * 1000), int(end.timestamp() * 1000)
+
+
 # Bitable returns text/select fields as either plain strings or rich-text segment
 # lists ([{type, text}, ...]). Normalize to a plain string.
 def _str_field(v: Any) -> str:
@@ -76,6 +96,20 @@ def _is_record_not_found(code: int | str | None, msg: str | None) -> bool:
             "不存在",
         )
     )
+
+
+def _record_belongs_to(fields: dict[str, Any], user_open_id: str) -> bool:
+    """判断「用户」人员字段里是否包含指定 open_id。
+
+    人员字段返回形如 [{"id": "ou_xxx", "name": ...}, ...] 的列表。
+    """
+    people = fields.get(F_USER)
+    if not isinstance(people, list):
+        return False
+    for person in people:
+        if isinstance(person, dict) and person.get("id") == user_open_id:
+            return True
+    return False
 
 
 def _transaction_from_fields(fields: dict[str, Any]) -> dict[str, Any]:
@@ -220,6 +254,77 @@ class BitableClient:
 
     def update_fields(self, record_id: str, fields: dict[str, Any]) -> None:
         self._update_fields(record_id, fields)
+
+    def month_total(
+        self,
+        user_open_id: str | None = None,
+        when_ms: int | None = None,
+    ) -> float:
+        """汇总 when_ms 所在自然月「已确认」记录的金额合计(默认当前月)。
+
+        通过状态字段在服务端过滤,再分页拉取后在本地按「录入时间」是否
+        落在本月求和。传入 user_open_id 时只统计该用户的记录。
+        """
+        start_ms, end_ms = _month_range_ms(when_ms)
+
+        # 服务端只按状态过滤;日期/用户在本地判断,避免依赖易错的日期过滤表达式。
+        filter_info = (
+            FilterInfo.builder()
+            .conjunction("and")
+            .conditions([
+                Condition.builder()
+                .field_name(F_STATUS)
+                .operator("is")
+                .value([STATUS_CONFIRMED])
+                .build()
+            ])
+            .build()
+        )
+
+        total = 0.0
+        page_token: str | None = None
+        while True:
+            body = (
+                SearchAppTableRecordRequestBody.builder()
+                .field_names([F_AMOUNT, F_CREATED_AT, F_USER])
+                .filter(filter_info)
+                .build()
+            )
+            req_builder = (
+                SearchAppTableRecordRequest.builder()
+                .app_token(self._app_token)
+                .table_id(self._table_id)
+                .page_size(500)
+                .request_body(body)
+            )
+            if page_token:
+                req_builder = req_builder.page_token(page_token)
+            resp = self._client.bitable.v1.app_table_record.search(req_builder.build())
+            if not resp.success():
+                raise RuntimeError(
+                    f"month_total search failed: code={resp.code} msg={resp.msg}"
+                )
+
+            for item in resp.data.items or []:
+                fields = item.fields or {}
+                created = fields.get(F_CREATED_AT)
+                if not isinstance(created, (int, float)):
+                    continue
+                if not (start_ms <= created < end_ms):
+                    continue
+                if user_open_id and not _record_belongs_to(fields, user_open_id):
+                    continue
+                amount = fields.get(F_AMOUNT)
+                try:
+                    total += float(amount)
+                except (TypeError, ValueError):
+                    continue
+
+            if not resp.data.has_more:
+                break
+            page_token = resp.data.page_token
+
+        return total
 
     def get_record(self, record_id: str) -> dict[str, Any]:
         req = (

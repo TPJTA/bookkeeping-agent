@@ -65,6 +65,11 @@ def is_confirmed(record_id: str) -> bool:
     return bitable_client.is_confirmed(record_id)
 
 
+def month_total(user_open_id: str | None = None) -> float:
+    """当前自然月「已确认」记录的金额合计(可按用户过滤)。"""
+    return bitable_client.month_total(user_open_id=user_open_id)
+
+
 def modify(
     record_id: str,
     user_text: str,

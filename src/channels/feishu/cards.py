@@ -143,7 +143,13 @@ def confirmed_card(
     transaction: dict[str, Any],
     source: str | None = None,
     image_key: str | None = None,
+    month_total: float | None = None,
 ) -> dict[str, Any]:
+    # 底部展示本自然月已确认花销合计;拿不到时回退到 record_id,方便排查。
+    if month_total is not None:
+        footer = f"📅 本月已记花销:**{_fmt_amount(str(month_total))}**"
+    else:
+        footer = f"record_id: `{record_id}`"
     return {
         "config": {"wide_screen_mode": True, "update_multi": True},
         "header": {
@@ -155,8 +161,7 @@ def confirmed_card(
             _fields_block(transaction),
             _goods_block(transaction),
             _screenshot_block(image_key),
-            {"tag": "note", "elements": [{"tag": "lark_md",
-             "content": f"record_id: `{record_id}`"}]},
+            {"tag": "note", "elements": [{"tag": "lark_md", "content": footer}]},
         ]),
     }
 

@@ -422,8 +422,17 @@ def _process_confirm(record_id: str, card_msg_id: str) -> None:
             "confidence": float(fields.get("置信度") or 0),
         }
         source = source or fields.get(F_SOURCE)
-        _safe_update(card_msg_id, cards.confirmed_card(record_id, tx, source, image_key))
-        logger.info("card updated to confirmed_card")
+        # 统计本自然月已确认花销,展示在卡片底部;失败不影响记账结果。
+        try:
+            month_total = core_actions.month_total()
+        except Exception:
+            logger.exception("step=month_total failed")
+            month_total = None
+        _safe_update(
+            card_msg_id,
+            cards.confirmed_card(record_id, tx, source, image_key, month_total),
+        )
+        logger.info("card updated to confirmed_card month_total=%s", month_total)
     except Exception:
         logger.exception("step=post-confirm card update failed")
 
