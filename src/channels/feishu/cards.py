@@ -7,6 +7,13 @@ module turns them into card JSON.
 from typing import Any
 
 
+_COMPLETABLE_FIELDS = (
+    ("merchant", "商户", "请输入商户名称"),
+    ("goods", "商品", "请输入商品名称"),
+    ("amount", "金额", "请输入金额，例如 25.80"),
+)
+
+
 def _fmt_amount(amount: str) -> str:
     if not amount:
         return "-"
@@ -102,6 +109,12 @@ def confirm_card(
     source: str | None = None,
     image_key: str | None = None,
 ) -> dict[str, Any]:
+    missing_fields = [
+        (name, label, placeholder)
+        for name, label, placeholder in _COMPLETABLE_FIELDS
+        if not str(transaction.get(name) or "").strip()
+    ]
+    completion_form = _completion_form(record_id, missing_fields)
     return {
         "config": {"wide_screen_mode": True, "update_multi": True},
         "header": {
@@ -116,6 +129,7 @@ def confirm_card(
             {"tag": "hr"},
             {"tag": "note", "elements": [{"tag": "lark_md",
              "content": "如需修改,直接回复此消息(例:「金额改成 50」「类别是交通」)"}]},
+            completion_form,
             {"tag": "action", "actions": [
                 {
                     "tag": "button",
@@ -136,6 +150,42 @@ def confirm_card(
             ]},
         ]),
     }
+
+
+def _completion_form(
+    record_id: str,
+    missing_fields: list[tuple[str, str, str]],
+) -> dict[str, Any] | None:
+    """Build an optional form containing only fields the model left empty."""
+    if not missing_fields:
+        return None
+
+    inputs = [
+        {
+            "tag": "input",
+            "name": name,
+            "required": False,
+            "label": {"tag": "plain_text", "content": label},
+            "placeholder": {"tag": "plain_text", "content": placeholder},
+        }
+        for name, label, placeholder in missing_fields
+    ]
+    inputs.extend([
+        {"tag": "note", "elements": [{"tag": "plain_text",
+         "content": "以上字段均为选填；也可以直接点击下方「确认」。"}]},
+        {
+            "tag": "action",
+            "actions": [{
+                "tag": "button",
+                "name": "submit_completion",
+                "text": {"tag": "plain_text", "content": "提交补全"},
+                "type": "default",
+                "action_type": "form_submit",
+                "value": {"action": "complete_missing", "record_id": record_id},
+            }],
+        },
+    ])
+    return {"tag": "form", "name": "missing_fields", "elements": inputs}
 
 
 def confirmed_card(
@@ -208,6 +258,29 @@ def invalidated_card(
             _screenshot_block(image_key),
             {"tag": "note", "elements": [{"tag": "lark_md",
              "content": "此版本已被新版本替代,请查看下方新卡片。"}]},
+        ]),
+    }
+
+
+def completion_submitted_card(
+    transaction: dict[str, Any],
+    source: str | None = None,
+    image_key: str | None = None,
+) -> dict[str, Any]:
+    """Old form card after its optional values have been submitted."""
+    return {
+        "config": {"wide_screen_mode": True, "update_multi": True},
+        "header": {
+            "title": {"tag": "plain_text",
+                      "content": f"✍️ 已补全 · {source}" if source else "✍️ 已补全"},
+            "template": "grey",
+        },
+        "elements": _without_none([
+            _fields_block(transaction),
+            _goods_block(transaction),
+            _screenshot_block(image_key),
+            {"tag": "note", "elements": [{"tag": "lark_md",
+             "content": "本次补全已提交,请在下方的新卡片中确认。"}]},
         ]),
     }
 

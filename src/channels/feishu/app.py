@@ -330,10 +330,14 @@ def _on_card_action(req: Any) -> Any:
         action = req.event.action
         value = action.value or {}
         card_msg_id = req.event.context.open_message_id
-        logger.info("card action value=%s card_msg_id=%s", value, card_msg_id)
+        form_value = getattr(action, "form_value", None) or {}
+        logger.info(
+            "card action value=%s form_value=%s card_msg_id=%s",
+            value, form_value, card_msg_id,
+        )
 
         action_type = value.get("action")
-        if action_type not in {"confirm", "cancel"}:
+        if action_type not in {"confirm", "cancel", "complete_missing"}:
             logger.info("ignore unknown card action: %s", value)
             return
 
@@ -351,6 +355,15 @@ def _on_card_action(req: Any) -> Any:
             ).start()
             return
 
+
+        if action_type == "complete_missing":
+            threading.Thread(
+                target=_process_completion,
+                args=(record_id, card_msg_id, form_value),
+                daemon=True,
+            ).start()
+            return
+
         threading.Thread(
             target=_process_confirm,
             args=(record_id, card_msg_id),
@@ -358,6 +371,43 @@ def _on_card_action(req: Any) -> Any:
         ).start()
     except Exception:
         logger.exception("card action handler crashed")
+
+
+def _process_completion(
+    record_id: str,
+    old_card_msg_id: str,
+    form_value: dict[str, Any],
+) -> None:
+    """Apply optional form values directly, then issue a fresh confirm card."""
+    logger.info(
+        "process_completion record_id=%s card_msg_id=%s",
+        record_id,
+        old_card_msg_id,
+    )
+    card_context = _lookup_card_context(old_card_msg_id) or {}
+    source = card_context.get("source")
+    image_key = card_context.get("image_key")
+    try:
+        transaction = core_actions.complete_missing_fields(record_id, form_value)
+        new_card_msg_id = _feishu.reply_card(
+            old_card_msg_id,
+            cards.confirm_card(record_id, transaction, source, image_key),
+        )
+    except Exception as e:
+        logger.exception("completion failed")
+        _safe_reply_to(old_card_msg_id, f"补全失败:{e}")
+        return
+
+    _safe_update(
+        old_card_msg_id,
+        cards.completion_submitted_card(transaction, source, image_key),
+    )
+    _forget_card(old_card_msg_id)
+    remember_card(new_card_msg_id, record_id, source=source, image_key=image_key)
+    logger.info(
+        "completion submitted old_card_msg_id=%s new_card_msg_id=%s record_id=%s",
+        old_card_msg_id, new_card_msg_id, record_id,
+    )
 
 
 def _process_cancel(
