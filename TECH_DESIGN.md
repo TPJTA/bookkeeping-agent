@@ -46,6 +46,7 @@
 | 12 | 来源标记 | **Bitable `来源` 单选** | 新记录写 `飞书` 或 `快捷方式`;历史记录不回填 |
 | 13 | Web 卡片截图 | **仅快捷方式来源展示缩略图** | 飞书来源已有原始图片消息,不重复展示 |
 | 14 | Webhook 目标会话 | **请求表单携带 `WEB_REVIEW_CHAT_ID`** | 不再校验 Bearer token;按请求参数决定反馈到哪个飞书会话 |
+| 15 | 识别空项补全 | **卡片内选填表单,直接写回 Bitable** | 仅为识别为空的商户/商品/金额显示输入框;保留确认按钮且不校验表单是否填写;提交不调用 LLM,原卡先显示识别中,完成后原地更新为待确认卡 |
 
 ---
 
@@ -196,7 +197,7 @@ START
 
 ### 5.3 修改(回复消息)— 实际采用「失效旧卡 + 新卡」对话流
 
-用户直接回复自然语言(如「金额改成 50」「这是交通不是餐饮」),channel 拿到回复事件后:
+用户直接回复自然语言(如「金额改成 50」「这是交通出行不是餐饮」),channel 拿到回复事件后:
 ```
 ① 定位记录:回复事件带 parent_id(=我们发的卡片消息)→ 查 card→record 映射得 record_id
 ② 状态守卫:若 record 已是「已确认」,直接文本回复"请去多维表格自行修改"并退出
@@ -214,6 +215,12 @@ START
 ```
 
 **关键不变量:** *只有真改了 Bitable 才动旧卡* —— 出错或意图不明时旧卡纹丝不动,用户继续操作不丢上下文。
+
+### 5.4 空项快捷补全(卡片表单)
+
+识别结果中的`商户`、`商品`、`金额`存在空字符串时,待确认卡片在常规确认/撤销按钮之外,只为对应空项展示输入框。三个字段均为选填;用户无需填写也可以直接确认。
+
+用户点击「提交修改」后,程序忽略仍为空的输入值,并且只允许写入原本为空的字段。非空金额必须能解析为数字。点击后原卡片立即更新为「识别中」无按钮状态。更新直接写入 Bitable,不调用 LLM;成功后在同一张卡片展示更新后的待确认内容,保留消息 ID、来源和截图上下文。卡片继续支持确认、撤销、自然语言修改,若仍有空项也继续展示补全表单。补全失败时重新读取记录,未确认记录恢复为待确认卡并提示错误;若无法读取则显示失败状态,避免卡片停留在识别中。
 
 **关于「是否需要新起会话」**:不需要。第 ⑤ 步是**一次性(one-shot)调用**,prompt 自带「当前 JSON + 修改文本」全部上下文,不依赖多轮对话记忆。也**不必去飞书拉父消息内容**——`parent_id` 只用来定位 `record_id`,字段值从 Bitable 读。
 
@@ -233,7 +240,7 @@ START
 |--------|------|------|
 | 商户 | 文本 | `transaction.merchant` |
 | 商品 | 文本 | `transaction.goods` |
-| 类别 | 单选(餐饮/交通/购物/娱乐/生活缴费/其他) | `transaction.category` |
+| 类别 | 单选(餐饮/超市生鲜/交通出行/居住缴费/旅行住宿/护肤美妆/服饰日用/游戏娱乐/数字服务/医疗健康/人情往来/其他) | `transaction.category` |
 | 金额 | 数字 | `transaction.amount`(转 float) |
 | 状态 | 单选(待确认/已确认) | 程序写入 |
 | 置信度 | 数字 | `transaction.confidence` |
@@ -395,6 +402,7 @@ bookkeeping-agent/
 | `code=1061004 forbidden` | scope 够了但 wiki 节点没把 bot 加为协作者 | 进 wiki 页面 → 添加协作者 → 选 bot → 「可编辑」 |
 | `code=1062009 size inconsistent` | `UploadAllMediaRequestBody.file()` 传了 raw bytes | 必须传 `io.BytesIO(bytes)`(SDK 期望 file-like) |
 | `code=200340` patch card 失败 | 卡片 config 没声明 `update_multi: true` | 所有 card config 加 `"update_multi": True` |
+| `code=230099` / `200830`: `schemaV2 card can not change schemaV1` | 待确认卡为 JSON 2.0,但补全、确认、撤销等状态模板仍用 1.0 | 所有状态统一 `schema: "2.0"` + `body.elements`,旧 `note` 改为 `div` 文本组件;终态不含按钮或表单 |
 | Pydantic 重试 N 次都失败:`category ''` not in enum | 非交易图模型返回空 category | validator 中 `if not v: return "其他"`——空值静默归一,非法值仍 raise 触发重试 |
 
 ### 11.6 Wiki 节点 token vs Bitable obj_token

@@ -2,9 +2,17 @@
 
 Card schemas are channel-specific, so all card construction lives in the
 feishu channel layer. core/ only emits structured `reply` payloads; this
-module turns them into card JSON.
+module turns them into card JSON. All states use JSON 2.0: Feishu rejects
+updates that downgrade an existing v2 message to v1.
 """
 from typing import Any
+
+
+_COMPLETABLE_FIELDS = (
+    ("merchant", "商户", "请输入商户名称"),
+    ("goods", "商品", "请输入商品名称"),
+    ("amount", "金额", "请输入金额，例如 25.80"),
+)
 
 
 def _fmt_amount(amount: str) -> str:
@@ -43,8 +51,8 @@ def _source_note(source: str | None) -> dict[str, Any] | None:
     if not source:
         return None
     return {
-        "tag": "note",
-        "elements": [{"tag": "lark_md", "content": f"来源:{source}"}],
+        "tag": "div",
+        "text": {"tag": "lark_md", "content": f"来源:{source}"},
     }
 
 
@@ -62,19 +70,24 @@ def _without_none(elements: list[dict[str, Any] | None]) -> list[dict[str, Any]]
     return [el for el in elements if el is not None]
 
 
-def pending_card(source: str | None = None) -> dict[str, Any]:
+def pending_card(
+    source: str | None = None,
+    *,
+    text: str = "正在分析订单截图,请稍候(预计 5-15 秒)",
+) -> dict[str, Any]:
     return {
+        "schema": "2.0",
         "config": {"wide_screen_mode": True, "update_multi": True},
         "header": {
             "title": {"tag": "plain_text",
                       "content": f"🔍 识别中 · {source}" if source else "🔍 识别中…"},
             "template": "blue",
         },
-        "elements": _without_none([
+        "body": {"elements": _without_none([
             {"tag": "div", "text": {"tag": "lark_md",
-             "content": "正在分析订单截图,请稍候(预计 5-15 秒)"}},
+             "content": text}},
             _source_note(source),
-        ]),
+        ])},
     }
 
 
@@ -82,17 +95,18 @@ def typing_card(text: str, source: str | None = None) -> dict[str, Any]:
     """Show the streaming model output as it arrives (typewriter effect)."""
     body = text.strip() if text else "(等待模型响应…)"
     return {
+        "schema": "2.0",
         "config": {"wide_screen_mode": True, "update_multi": True},
         "header": {
             "title": {"tag": "plain_text",
                       "content": f"🔍 识别中 · {source} ✍️" if source else "🔍 识别中… ✍️"},
             "template": "blue",
         },
-        "elements": _without_none([
+        "body": {"elements": _without_none([
             {"tag": "div", "text": {"tag": "lark_md",
              "content": f"```\n{body}\n```"}},
             _source_note(source),
-        ]),
+        ])},
     }
 
 
@@ -102,28 +116,40 @@ def confirm_card(
     source: str | None = None,
     image_key: str | None = None,
 ) -> dict[str, Any]:
+    missing_fields = [
+        (name, label, placeholder)
+        for name, label, placeholder in _COMPLETABLE_FIELDS
+        if not str(transaction.get(name) or "").strip()
+    ]
+    completion_form = _completion_form(record_id, missing_fields)
+    # Form containers and input components are Card JSON 2.0 components.  A
+    # top-level ``elements`` array is the legacy card shape; Feishu silently
+    # omits v2-only components when they are placed there.  Keep this card in
+    # the documented v2 ``body.elements`` shape so missing-field inputs render.
     return {
+        "schema": "2.0",
         "config": {"wide_screen_mode": True, "update_multi": True},
         "header": {
             "title": {"tag": "plain_text",
                       "content": f"📋 待确认 · {source}" if source else "📋 待确认"},
             "template": "yellow",
         },
-        "elements": _without_none([
+        "body": {"elements": _without_none([
             _fields_block(transaction),
             _goods_block(transaction),
             _screenshot_block(image_key),
             {"tag": "hr"},
-            {"tag": "note", "elements": [{"tag": "lark_md",
-             "content": "如需修改,直接回复此消息(例:「金额改成 50」「类别是交通」)"}]},
-            {"tag": "action", "actions": [
-                {
+            {"tag": "div", "text": {"tag": "lark_md",
+             "content": "如需修改,直接回复此消息(例:「金额改成 50」「类别是交通出行」)"}},
+            completion_form,
+            {"tag": "column_set", "horizontal_spacing": "8px", "columns": [
+                {"tag": "column", "width": "auto", "elements": [{
                     "tag": "button",
                     "text": {"tag": "plain_text", "content": "✅ 确认"},
                     "type": "primary",
                     "value": {"action": "confirm", "record_id": record_id},
-                },
-                {
+                }]},
+                {"tag": "column", "width": "auto", "elements": [{
                     "tag": "button",
                     "text": {"tag": "plain_text", "content": "撤销"},
                     "type": "danger",
@@ -132,9 +158,63 @@ def confirm_card(
                         "record_id": record_id,
                         "transaction": transaction,
                     },
-                }
+                }]}
             ]},
-        ]),
+        ])},
+    }
+
+
+def _completion_form(
+    record_id: str,
+    missing_fields: list[tuple[str, str, str]],
+) -> dict[str, Any] | None:
+    """Build an optional form containing only fields the model left empty."""
+    if not missing_fields:
+        return None
+
+    columns = [
+        {
+            "tag": "column",
+            "width": "weighted",
+            "elements": [{
+                "tag": "input",
+                "name": name,
+                "required": False,
+                "placeholder": {"tag": "plain_text", "content": placeholder},
+                "default_value": "",
+                "width": "default",
+                "label": {"tag": "plain_text", "content": label},
+                "label_position": "left",
+                "margin": "0px 0px 0px 0px",
+            }],
+            "vertical_align": "top",
+            "weight": 1,
+        }
+        for name, label, placeholder in missing_fields
+    ]
+    return {
+        "tag": "form",
+        "name": "missing_fields",
+        "elements": [
+            {
+                "tag": "column_set",
+                "horizontal_spacing": "8px",
+                "horizontal_align": "left",
+                "columns": columns,
+                "margin": "0px 0px 0px 0px",
+            },
+            {
+                "tag": "button",
+                "name": "submit_completion",
+                "text": {"tag": "plain_text", "content": "提交修改"},
+                "type": "default",
+                "width": "fill",
+                "size": "medium",
+                "margin": "0px 0px 0px 0px",
+                "action_type": "form_submit",
+                "value": {"action": "complete_missing", "record_id": record_id},
+            },
+        ],
     }
 
 
@@ -151,18 +231,19 @@ def confirmed_card(
     else:
         footer = f"record_id: `{record_id}`"
     return {
+        "schema": "2.0",
         "config": {"wide_screen_mode": True, "update_multi": True},
         "header": {
             "title": {"tag": "plain_text",
                       "content": f"✅ 已记账 · {source}" if source else "✅ 已记账"},
             "template": "green",
         },
-        "elements": _without_none([
+        "body": {"elements": _without_none([
             _fields_block(transaction),
             _goods_block(transaction),
             _screenshot_block(image_key),
-            {"tag": "note", "elements": [{"tag": "lark_md", "content": footer}]},
-        ]),
+            {"tag": "div", "text": {"tag": "lark_md", "content": footer}},
+        ])},
     }
 
 
@@ -172,19 +253,20 @@ def cancelled_card(
     image_key: str | None = None,
 ) -> dict[str, Any]:
     return {
+        "schema": "2.0",
         "config": {"wide_screen_mode": True, "update_multi": True},
         "header": {
             "title": {"tag": "plain_text",
                       "content": f"已撤销 · {source}" if source else "已撤销"},
             "template": "grey",
         },
-        "elements": _without_none([
+        "body": {"elements": _without_none([
             _fields_block(transaction),
             _goods_block(transaction),
             _screenshot_block(image_key),
-            {"tag": "note", "elements": [{"tag": "lark_md",
-             "content": "该待确认记录已撤销,多维表格中的候选记录已删除。"}]},
-        ]),
+            {"tag": "div", "text": {"tag": "lark_md",
+             "content": "该待确认记录已撤销,多维表格中的候选记录已删除。"}},
+        ])},
     }
 
 
@@ -196,35 +278,61 @@ def invalidated_card(
     """Old card after the record was modified by the user. Shows previous
     values, marked as superseded."""
     return {
+        "schema": "2.0",
         "config": {"wide_screen_mode": True, "update_multi": True},
         "header": {
             "title": {"tag": "plain_text",
                       "content": f"🚫 已失效 · {source}" if source else "🚫 已失效"},
             "template": "grey",
         },
-        "elements": _without_none([
+        "body": {"elements": _without_none([
             _fields_block(transaction),
             _goods_block(transaction),
             _screenshot_block(image_key),
-            {"tag": "note", "elements": [{"tag": "lark_md",
-             "content": "此版本已被新版本替代,请查看下方新卡片。"}]},
-        ]),
+            {"tag": "div", "text": {"tag": "lark_md",
+             "content": "此版本已被新版本替代,请查看下方新卡片。"}},
+        ])},
+    }
+
+
+def completion_submitted_card(
+    transaction: dict[str, Any],
+    source: str | None = None,
+    image_key: str | None = None,
+) -> dict[str, Any]:
+    """Old form card after its optional values have been submitted."""
+    return {
+        "schema": "2.0",
+        "config": {"wide_screen_mode": True, "update_multi": True},
+        "header": {
+            "title": {"tag": "plain_text",
+                      "content": f"✍️ 已补全 · {source}" if source else "✍️ 已补全"},
+            "template": "grey",
+        },
+        "body": {"elements": _without_none([
+            _fields_block(transaction),
+            _goods_block(transaction),
+            _screenshot_block(image_key),
+            {"tag": "div", "text": {"tag": "lark_md",
+             "content": "本次补全已提交,请在下方的新卡片中确认。"}},
+        ])},
     }
 
 
 def no_modification_card(source: str | None = None) -> dict[str, Any]:
     return {
+        "schema": "2.0",
         "config": {"wide_screen_mode": True, "update_multi": True},
         "header": {
             "title": {"tag": "plain_text",
                       "content": f"❓ 未识别修改 · {source}" if source else "❓ 未识别修改"},
             "template": "grey",
         },
-        "elements": _without_none([
+        "body": {"elements": _without_none([
             {"tag": "div", "text": {"tag": "lark_md",
-             "content": "没听懂这条消息的修改意图,可以更具体一点(例:「金额改成 50」「类别改为交通」)。原记录未变更。"}},
+             "content": "没听懂这条消息的修改意图,可以更具体一点(例:「金额改成 50」「类别改为交通出行」)。原记录未变更。"}},
             _source_note(source),
-        ]),
+        ])},
     }
 
 
@@ -234,29 +342,31 @@ def not_transaction_card(
     image_key: str | None = None,
 ) -> dict[str, Any]:
     return {
+        "schema": "2.0",
         "config": {"wide_screen_mode": True, "update_multi": True},
         "header": {
             "title": {"tag": "plain_text",
                       "content": f"❓ 非交易截图 · {source}" if source else "❓ 非交易截图"},
             "template": "grey",
         },
-        "elements": _without_none([
+        "body": {"elements": _without_none([
             {"tag": "div", "text": {"tag": "lark_md", "content": text}},
             _screenshot_block(image_key),
-        ]),
+        ])},
     }
 
 
 def error_card(text: str, source: str | None = None) -> dict[str, Any]:
     return {
+        "schema": "2.0",
         "config": {"wide_screen_mode": True, "update_multi": True},
         "header": {
             "title": {"tag": "plain_text",
                       "content": f"❌ 处理失败 · {source}" if source else "❌ 处理失败"},
             "template": "red",
         },
-        "elements": _without_none([
+        "body": {"elements": _without_none([
             {"tag": "div", "text": {"tag": "lark_md", "content": text}},
             _source_note(source),
-        ]),
+        ])},
     }
