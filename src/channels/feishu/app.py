@@ -330,10 +330,14 @@ def _on_card_action(req: Any) -> Any:
         action = req.event.action
         value = action.value or {}
         card_msg_id = req.event.context.open_message_id
-        logger.info("card action value=%s card_msg_id=%s", value, card_msg_id)
+        form_value = getattr(action, "form_value", None) or {}
+        logger.info(
+            "card action value=%s form_value=%s card_msg_id=%s",
+            value, form_value, card_msg_id,
+        )
 
         action_type = value.get("action")
-        if action_type not in {"confirm", "cancel"}:
+        if action_type not in {"confirm", "cancel", "complete_missing"}:
             logger.info("ignore unknown card action: %s", value)
             return
 
@@ -351,6 +355,15 @@ def _on_card_action(req: Any) -> Any:
             ).start()
             return
 
+
+        if action_type == "complete_missing":
+            threading.Thread(
+                target=_process_completion,
+                args=(record_id, card_msg_id, form_value),
+                daemon=True,
+            ).start()
+            return
+
         threading.Thread(
             target=_process_confirm,
             args=(record_id, card_msg_id),
@@ -358,6 +371,52 @@ def _on_card_action(req: Any) -> Any:
         ).start()
     except Exception:
         logger.exception("card action handler crashed")
+
+
+def _process_completion(
+    record_id: str,
+    card_msg_id: str,
+    form_value: dict[str, Any],
+) -> None:
+    """Show progress and the completed candidate in the same card message."""
+    logger.info(
+        "process_completion record_id=%s card_msg_id=%s",
+        record_id,
+        card_msg_id,
+    )
+    card_context = _lookup_card_context(card_msg_id) or {}
+    source = card_context.get("source")
+    image_key = card_context.get("image_key")
+    _safe_update(
+        card_msg_id,
+        cards.pending_card(source, text="正在更新补全内容,请稍候…"),
+    )
+    try:
+        transaction = core_actions.complete_missing_fields(record_id, form_value)
+    except Exception as e:
+        logger.exception("completion failed")
+        # Validation failures should leave the form available for another try.
+        # Reload persisted values in case a write succeeded before an error.
+        recovery_card = cards.error_card(f"补全失败:{e}", source)
+        try:
+            if not core_actions.is_confirmed(record_id):
+                transaction = core_actions.get_transaction(record_id)
+                recovery_card = cards.confirm_card(record_id, transaction, source, image_key)
+        except Exception:
+            logger.exception("completion: failed to reload card after error")
+        _safe_update(card_msg_id, recovery_card)
+        _safe_reply_to(card_msg_id, f"补全失败:{e}")
+        return
+
+    _safe_update(
+        card_msg_id,
+        cards.confirm_card(record_id, transaction, source, image_key),
+    )
+    remember_card(card_msg_id, record_id, source=source, image_key=image_key)
+    logger.info(
+        "completion submitted in place card_msg_id=%s record_id=%s",
+        card_msg_id, record_id,
+    )
 
 
 def _process_cancel(

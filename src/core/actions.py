@@ -70,6 +70,37 @@ def month_total(user_open_id: str | None = None) -> float:
     return bitable_client.month_total(user_open_id=user_open_id)
 
 
+def complete_missing_fields(record_id: str, values: dict[str, Any]) -> dict[str, Any]:
+    """Directly fill optional blank fields without making another LLM call.
+
+    Only merchant, goods and amount are accepted. Blank submitted values are
+    ignored, and existing non-blank values cannot be overwritten through this
+    shortcut; users can still use the natural-language modification flow for
+    ordinary edits.
+    """
+    fields = bitable_client.get_record(record_id)
+    if bitable_client.fields_are_confirmed(fields):
+        raise ValueError("该记录已确认,不能再补全")
+
+    current_tx = bitable_client.transaction_from_fields(fields)
+    updates: dict[str, str] = {}
+    for name in ("merchant", "goods", "amount"):
+        value = str(values.get(name) or "").strip()
+        if value and not str(current_tx.get(name) or "").strip():
+            updates[name] = value
+
+    if amount := updates.get("amount"):
+        try:
+            float(amount)
+        except ValueError as exc:
+            raise ValueError("金额必须是数字") from exc
+
+    if updates:
+        bitable_client.update_transaction_fields(record_id, updates)
+    current_tx.update(updates)
+    return current_tx
+
+
 def modify(
     record_id: str,
     user_text: str,

@@ -1,6 +1,19 @@
 from pydantic import BaseModel, Field, field_validator
 
-VALID_CATEGORIES = {"餐饮", "交通", "购物", "娱乐", "生活缴费", "其他"}
+VALID_CATEGORIES = {
+    "餐饮",
+    "超市生鲜",
+    "交通出行",
+    "居住缴费",
+    "旅行住宿",
+    "护肤美妆",
+    "服饰日用",
+    "游戏娱乐",
+    "数字服务",
+    "医疗健康",
+    "人情往来",
+    "其他",
+}
 
 
 class ModifyResult(BaseModel):

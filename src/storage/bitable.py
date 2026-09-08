@@ -370,6 +370,25 @@ class BitableClient:
             fields[F_AMOUNT] = amount
         self._update_fields(record_id, fields)
 
+    def update_transaction_fields(
+        self,
+        record_id: str,
+        values: dict[str, str],
+    ) -> None:
+        """Update a validated subset of user-editable transaction fields."""
+        field_names = {
+            "merchant": F_MERCHANT,
+            "goods": F_GOODS,
+            "amount": F_AMOUNT,
+        }
+        fields: dict[str, Any] = {}
+        for name, value in values.items():
+            if name not in field_names:
+                continue
+            fields[field_names[name]] = float(value) if name == "amount" else value
+        if fields:
+            self._update_fields(record_id, fields)
+
     def is_confirmed(self, record_id: str) -> bool:
         return self.fields_are_confirmed(self.get_record(record_id))
 
